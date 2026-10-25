@@ -1,0 +1,44 @@
+# A config-v* tag (or a manual run) builds the configuration release of ansible/, with
+# community.general from Galaxy, and publishes it. Publishing does not apply it: that is
+# bin/config.sh apply <version>, through the idle color.
+name: config-release
+
+on:
+  push:
+    tags: ['config-v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Configuration version to publish (x.y.z)
+        required: true
+      environment:
+        description: GitHub environment with AWS_REGION, AWS_ROLE_ARN and ENV_NAME
+        default: dev
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: config-release-${{ github.ref }}
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    environment: ${{ inputs.environment || 'dev' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Publish the configuration release
+        env:
+          ENV_NAME: ${{ vars.ENV_NAME }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          VERSION: ${{ inputs.version || github.ref_name }}
+        run: |
+          cp config/example.env "config/${ENV_NAME}.env"
+          bin/config.sh release "${VERSION#config-v}"

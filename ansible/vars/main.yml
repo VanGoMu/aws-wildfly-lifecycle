@@ -1,0 +1,22 @@
+---
+# Where WildFly lives on the instances (remote/install-wildfly.sh puts it there).
+wildfly_home: /opt/wildfly
+wildfly_config: "{{ wildfly_home }}/standalone/configuration/standalone.xml"
+wildfly_cli: "{{ wildfly_home }}/bin/jboss-cli.sh"
+wildfly_service: wildfly
+wildfly_user: wildfly
+instance_env: /etc/wildfly-lifecycle/instance.env
+
+# The system properties this release owns: app.* from Parameter Store, app.secret.* for each key
+# of the secret, and lifecycle.* for the version and the fingerprint. Any other property in
+# <system-properties> is left alone.
+managed_property_pattern: '^(app|lifecycle)[.]'
+parameter_name_pattern: '^app[.][a-z0-9.-]+$'
+secret_key_pattern: '^[A-Z][A-Z0-9_]{0,63}$'
+
+# standalone.xml copies kept next to it, newest first.
+backups_keep: 2
+
+# Up to two and a half minutes for WildFly to be ready after the restart.
+ready_retries: 30
+ready_delay: 5

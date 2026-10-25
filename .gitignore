@@ -1,0 +1,6 @@
+prompt-claude.md
+config/*.env
+!config/example.env
+build/
+app/target/
+__pycache__/

@@ -1,0 +1,16 @@
+---
+# wfl-<env>-Validate (Command). Runs the validation that InstallWildFly installed with the platform
+# scripts: the same file the CodeDeploy ValidateService hook runs. Used by bin/instance.sh and by
+# the Switch runbook. It takes no parameters.
+schemaVersion: '2.2'
+description: >-
+  aws-wildfly-lifecycle: WildFly active and running, health/ready UP, every WAR of the release
+  deployed and OK, and HEALTH_PATH answering. Ends with one JSON line.
+mainSteps:
+  - action: aws:runShellScript
+    name: validate
+    precondition:
+      StringEquals: [platformType, Linux]
+    inputs:
+      timeoutSeconds: '600'
+      runCommand: [/opt/wildfly-lifecycle/bin/validate.sh]

@@ -1,0 +1,188 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  aws-wildfly-lifecycle load balancer: ALB, its security group, one target group per color, a
+  weighted production listener, a test listener and the …/infra/alb contract the runbooks read.
+  The instances live in their own stacks (templates/instance.yml).
+
+Parameters:
+  Prefix:
+    Type: String
+    AllowedPattern: '^wfl-[a-z][a-z0-9]{0,9}$'
+  ParameterRoot:
+    Type: String
+    AllowedPattern: '^/aws-wildfly-lifecycle/[a-z][a-z0-9]{0,9}$'
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+  AppPort:
+    Type: Number
+    MinValue: 1024
+    MaxValue: 65535
+  HealthPath:
+    Type: String
+    AllowedPattern: '^/[A-Za-z0-9/_.-]*$'
+  AlbIngressCidr:
+    Type: String
+    AllowedPattern: '^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$'
+  AllowedCidr:
+    Type: String
+    Description: The only origin of the test listener.
+    AllowedPattern: '^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$'
+  CertificateArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '^(arn:aws[a-z-]*:acm:[a-z0-9-]+:[0-9]{12}:certificate/[0-9a-f-]+)?$'
+  # The runbooks move the weights outside CloudFormation. On an update, bin/alb.sh reads them from
+  # the live listener (holding the lock) and passes them here, so the update writes the weights
+  # already in place instead of sending the traffic back to the initial values.
+  BlueWeight:
+    Type: Number
+    Default: 100
+    MinValue: 0
+    MaxValue: 999
+  GreenWeight:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    MaxValue: 999
+  TestColor:
+    Type: String
+    Default: green
+    AllowedValues: [blue, green]
+  TestListenerPort:
+    Type: Number
+    Default: 8081
+
+Conditions:
+  HasCertificate: !Not [!Equals [!Ref CertificateArn, '']]
+  TestBlue: !Equals [!Ref TestColor, blue]
+
+Resources:
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub '${Prefix} ALB: production from AlbIngressCidr, test from AllowedCidr'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: !Ref AlbIngressCidr}
+        - !If
+          - HasCertificate
+          - {IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: !Ref AlbIngressCidr}
+          - !Ref AWS::NoValue
+        - IpProtocol: tcp
+          FromPort: !Ref TestListenerPort
+          ToPort: !Ref TestListenerPort
+          CidrIp: !Ref AllowedCidr
+      Tags:
+        - {Key: Name, Value: !Sub '${Prefix}-alb'}
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Ref Prefix
+      Scheme: internet-facing
+      Type: application
+      Subnets: !Ref SubnetIds
+      SecurityGroups: [!Ref AlbSecurityGroup]
+
+  # No stickiness: with sticky sessions the canary would split users, not requests.
+  BlueTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${Prefix}-blue'
+      VpcId: !Ref VpcId
+      Protocol: HTTP
+      Port: !Ref AppPort
+      TargetType: instance
+      HealthCheckPath: !Ref HealthPath
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      TargetGroupAttributes:
+        - {Key: deregistration_delay.timeout_seconds, Value: '30'}
+        - {Key: stickiness.enabled, Value: 'false'}
+      Tags:
+        - {Key: Color, Value: blue}
+
+  GreenTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${Prefix}-green'
+      VpcId: !Ref VpcId
+      Protocol: HTTP
+      Port: !Ref AppPort
+      TargetType: instance
+      HealthCheckPath: !Ref HealthPath
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      TargetGroupAttributes:
+        - {Key: deregistration_delay.timeout_seconds, Value: '30'}
+        - {Key: stickiness.enabled, Value: 'false'}
+      Tags:
+        - {Key: Color, Value: green}
+
+  # Both target groups hang from it all the time; the weights are relative (90/10 is the canary).
+  ProductionListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: !If [HasCertificate, 443, 80]
+      Protocol: !If [HasCertificate, HTTPS, HTTP]
+      SslPolicy: !If [HasCertificate, ELBSecurityPolicy-TLS13-1-2-2021-06, !Ref AWS::NoValue]
+      Certificates: !If [HasCertificate, [{CertificateArn: !Ref CertificateArn}], !Ref AWS::NoValue]
+      DefaultActions:
+        - Type: forward
+          ForwardConfig:
+            TargetGroups:
+              - {TargetGroupArn: !Ref BlueTargetGroup, Weight: !Ref BlueWeight}
+              - {TargetGroupArn: !Ref GreenTargetGroup, Weight: !Ref GreenWeight}
+            TargetGroupStickinessConfig: {Enabled: false}
+
+  RedirectListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: HasCertificate
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: redirect
+          RedirectConfig: {Protocol: HTTPS, Port: '443', StatusCode: HTTP_301}
+
+  # On the idle color: the new release is tried through the real ALB before it gets traffic.
+  TestListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: !Ref TestListenerPort
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !If [TestBlue, !Ref BlueTargetGroup, !Ref GreenTargetGroup]
+
+  # The only thing the runbooks read about the ALB: an ALB made by hand works if it writes this.
+  InfraParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '${ParameterRoot}/infra/alb'
+      Type: String
+      Description: aws-wildfly-lifecycle ALB contract (runbook.py)
+      Value: !Sub
+        - >-
+          {"loadBalancer": "${LoadBalancer.LoadBalancerFullName}",
+          "productionListenerArn": "${ProductionListener}",
+          "testListenerArn": "${TestListener}",
+          "albSecurityGroupId": "${AlbSecurityGroup}",
+          "targetGroups": {
+          "blue": {"arn": "${BlueTargetGroup}", "dimension": "${BlueDimension}"},
+          "green": {"arn": "${GreenTargetGroup}", "dimension": "${GreenDimension}"}}}
+        - BlueDimension: !GetAtt BlueTargetGroup.TargetGroupFullName
+          GreenDimension: !GetAtt GreenTargetGroup.TargetGroupFullName
+
+Outputs:
+  LoadBalancerDnsName:
+    Value: !GetAtt LoadBalancer.DNSName
+  InfraParameterName:
+    Value: !Ref InfraParameter

@@ -1,0 +1,76 @@
+---
+# wfl-<env>-Switch (Automation). Validates a color and makes it the active one: Release runs it
+# nested, and bin/alb.sh switch and bin/app.sh rollback start it holding the lock. It does not take
+# the lock: whoever calls it holds it. A rollback is just this, to the idle color, which keeps the
+# previous release; the per-color state already says what each color has.
+schemaVersion: '0.3'
+description: >-
+  aws-wildfly-lifecycle: validate a color and give it the production traffic (100/0, the test
+  listener on the other color, and …/state/active-color).
+assumeRole: '{{ AutomationAssumeRole }}'
+parameters:
+  TargetColor: {type: String, allowedValues: [blue, green]}
+  AutomationAssumeRole:
+    {type: String, allowedPattern: '^arn:aws[a-z-]*:iam::[0-9]{12}:role/wfl-[a-z][a-z0-9]{0,9}-automation$'}
+  # Derived names: bin/setup.sh render writes them as defaults.
+  Environment: {type: String, allowedPattern: '^[a-z][a-z0-9]{0,9}$'}
+  Project: {type: String, allowedPattern: '^aws-wildfly-lifecycle$'}
+  Prefix: {type: String, allowedPattern: '^wfl-[a-z][a-z0-9]{0,9}$'}
+  ParameterRoot: {type: String, allowedPattern: '^/aws-wildfly-lifecycle/[a-z][a-z0-9]{0,9}$'}
+  ValidateDocument: {type: String, allowedPattern: '^wfl-[a-z][a-z0-9]{0,9}-Validate$'}
+mainSteps:
+  - name: Plan
+    action: aws:executeScript
+    timeoutSeconds: 60
+    inputs:
+      Runtime: python3.12
+      Handler: plan
+      Script: ''
+      InputPayload:
+        Mode: switch
+        TargetColor: '{{ TargetColor }}'
+        Environment: '{{ Environment }}'
+        Project: '{{ Project }}'
+        ParameterRoot: '{{ ParameterRoot }}'
+    outputs:
+      - {Name: TargetInstanceId, Selector: $.Payload.TargetInstanceId, Type: String}
+      - {Name: TargetGroupArn, Selector: $.Payload.TargetGroupArn, Type: String}
+      - {Name: HasAlb, Selector: $.Payload.HasAlb, Type: Boolean}
+  - name: Validate
+    action: aws:runCommand
+    timeoutSeconds: 900
+    inputs:
+      DocumentName: '{{ ValidateDocument }}'
+      InstanceIds: ['{{ Plan.TargetInstanceId }}']
+  - name: HasAlb
+    action: aws:branch
+    inputs:
+      Choices: [{NextStep: WaitHealthy, Variable: '{{ Plan.HasAlb }}', BooleanEquals: true}]
+      Default: SetActive
+  - name: WaitHealthy
+    action: aws:waitForAwsResourceProperty
+    timeoutSeconds: 300
+    inputs:
+      Service: elbv2
+      Api: DescribeTargetHealth
+      TargetGroupArn: '{{ Plan.TargetGroupArn }}'
+      PropertySelector: $.TargetHealthDescriptions[0].TargetHealth.State
+      DesiredValues: [healthy]
+  - name: Shift
+    action: aws:executeScript
+    timeoutSeconds: 60
+    inputs:
+      Runtime: python3.12
+      Handler: shift_traffic
+      Script: ''
+      InputPayload:
+        Target: '{{ TargetColor }}'
+        Weight: 100
+        Environment: '{{ Environment }}'
+        Project: '{{ Project }}'
+        ParameterRoot: '{{ ParameterRoot }}'
+  - name: SetActive
+    action: aws:executeAwsApi
+    isEnd: true
+    inputs: {Service: ssm, Api: PutParameter, Name: '{{ ParameterRoot }}/state/active-color',
+             Value: '{{ TargetColor }}', Type: String, Overwrite: true}

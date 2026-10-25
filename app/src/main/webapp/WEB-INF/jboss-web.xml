@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Sin esto WildFly publica el WAR en /wildfly-demo y /health da 404: la app vive en la raíz. -->
+<jboss-web>
+  <context-root>/</context-root>
+</jboss-web>

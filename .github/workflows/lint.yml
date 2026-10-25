@@ -1,0 +1,50 @@
+# Everything that can be checked without AWS, with the versions the repository was validated
+# with. ansible-core 2.15 is what the instances run (Amazon Linux 2023); as a controller it needs
+# Python 3.11 at most.
+name: lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+
+      - name: Install the linters
+        run: |
+          pip install cfn-lint==1.58.0 ruff==0.17.2 ansible-core==2.15.13
+          ansible-galaxy collection install community.general:==10.7.9
+
+      - name: bash
+        run: |
+          bash -n bin/*.sh lib/*.sh remote/*.sh codedeploy/hooks/*.sh
+          shellcheck -x -S warning bin/*.sh lib/*.sh remote/*.sh codedeploy/hooks/*.sh
+          awk 'length > 100 { print FILENAME ":" FNR; bad = 1 } END { exit bad }' \
+            bin/*.sh lib/*.sh remote/*.sh automation/runbook.py
+
+      - name: Python
+        run: |
+          ruff check automation/runbook.py
+          python -m py_compile automation/runbook.py
+
+      - name: CloudFormation
+        run: cfn-lint templates/*.yml
+
+      - name: Ansible
+        run: ansible-playbook --syntax-check -i localhost, ansible/site.yml
+
+      - name: GitHub Actions
+        run: >-
+          docker run --rm -v "$PWD:/repo" -w /repo
+          rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667

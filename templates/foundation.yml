@@ -1,0 +1,370 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  aws-wildfly-lifecycle foundation: release bucket and its policy, roles, the CodeDeploy
+  application with a deployment group per color, the release rule and the optional GitHub OIDC
+  role. Stack tags (Project, Environment, Component) reach every resource.
+
+Parameters:
+  Project:
+    Type: String
+    AllowedPattern: '^aws-wildfly-lifecycle$'
+  EnvName:
+    Type: String
+    AllowedPattern: '^[a-z][a-z0-9]{0,9}$'
+  Prefix:
+    Type: String
+    AllowedPattern: '^wfl-[a-z][a-z0-9]{0,9}$'
+  BucketName:
+    Type: String
+    AllowedPattern: '^wfl-[a-z0-9-]{3,58}$'
+  ParameterRoot:
+    Type: String
+    AllowedPattern: '^/aws-wildfly-lifecycle/[a-z][a-z0-9]{0,9}$'
+  SecretName:
+    Type: String
+    AllowedPattern: '^aws-wildfly-lifecycle/[a-z][a-z0-9]{0,9}/app$'
+  GitHubSubject:
+    Type: String
+    Default: ''
+    Description: 'The sub claim the GitHub role trusts: <sub_claim_prefix>:environment:<env>.'
+    AllowedPattern: '^(repo:[^:]+:environment:[A-Za-z0-9_.-]+)?$'
+  CreateOidcProvider:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+
+Conditions:
+  HasGitHub: !Not [!Equals [!Ref GitHubSubject, '']]
+  CreateOidc: !And [!Condition HasGitHub, !Equals [!Ref CreateOidcProvider, 'true']]
+
+Resources:
+  ReleaseBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+      VersioningConfiguration: {Status: Enabled}
+      OwnershipControls:
+        Rules: [{ObjectOwnership: BucketOwnerEnforced}]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      NotificationConfiguration:
+        EventBridgeConfiguration: {EventBridgeEnabled: true}
+
+  # Every key under these prefixes is written once (S3 "Enforce conditional writes"); with this
+  # policy a CopyObject without the header fails too. The roles that run things cannot delete
+  # versions; whoever administers the account (bin/destroy.sh) is not affected.
+  ReleaseBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ReleaseBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource: [!GetAtt ReleaseBucket.Arn, !Sub '${ReleaseBucket.Arn}/*']
+            Condition: {Bool: {'aws:SecureTransport': 'false'}}
+          - Sid: DenyUnconditionalWrites
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:PutObject'
+            Resource:
+              - !Sub '${ReleaseBucket.Arn}/releases/*'
+              - !Sub '${ReleaseBucket.Arn}/config-releases/*'
+              - !Sub '${ReleaseBucket.Arn}/platform/*'
+              - !Sub '${ReleaseBucket.Arn}/vendor/*'
+            Condition: {'Null': {'s3:if-none-match': 'true'}}
+          - Sid: DenyVersionDeletionByAutomation
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:DeleteObjectVersion'
+            Resource:
+              - !Sub '${ReleaseBucket.Arn}/releases/*'
+              - !Sub '${ReleaseBucket.Arn}/config-releases/*'
+              - !Sub '${ReleaseBucket.Arn}/platform/*'
+              - !Sub '${ReleaseBucket.Arn}/vendor/*'
+            Condition:
+              ArnEquals:
+                'aws:PrincipalArn':
+                  - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${Prefix}-instance'
+                  - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${Prefix}-automation'
+                  - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${Prefix}-github'
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Prefix}-instance'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: ec2.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+      Policies:
+        - PolicyName: lifecycle
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['s3:GetObject', 's3:GetObjectVersion']
+                Resource:
+                  - !Sub '${ReleaseBucket.Arn}/releases/*'
+                  - !Sub '${ReleaseBucket.Arn}/config-releases/*'
+                  - !Sub '${ReleaseBucket.Arn}/platform/*'
+                  - !Sub '${ReleaseBucket.Arn}/vendor/*'
+              # The CodeDeploy agent documentation asks for its regional resource kit bucket.
+              - Effect: Allow
+                Action: ['s3:Get*', 's3:List*']
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:s3:::aws-codedeploy-${AWS::Region}'
+                  - !Sub 'arn:${AWS::Partition}:s3:::aws-codedeploy-${AWS::Region}/*'
+              - Effect: Allow
+                Action: 'ssm:GetParametersByPath'
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ParameterRoot}/config'
+              - Effect: Allow
+                Action: ['secretsmanager:GetSecretValue', 'secretsmanager:DescribeSecret']
+                Resource: !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretName}-??????'
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${Prefix}-instance'
+      Roles: [!Ref InstanceRole]
+
+  CodeDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Prefix}-codedeploy'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: codedeploy.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSCodeDeployRole'
+
+  Application:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ApplicationName: !Ref Prefix
+      ComputePlatform: Server
+
+  # One deployment group per color, selected by tags. In place, without LoadBalancerInfo: the
+  # release lands on the idle color and the Release runbook moves the traffic.
+  BlueDeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: !Ref Application
+      DeploymentGroupName: !Sub '${Prefix}-blue'
+      ServiceRoleArn: !GetAtt CodeDeployRole.Arn
+      DeploymentConfigName: CodeDeployDefault.AllAtOnce
+      DeploymentStyle: {DeploymentType: IN_PLACE, DeploymentOption: WITHOUT_TRAFFIC_CONTROL}
+      AutoRollbackConfiguration: {Enabled: true, Events: [DEPLOYMENT_FAILURE]}
+      Ec2TagSet:
+        Ec2TagSetList:
+          - Ec2TagGroup: [{Key: Project, Value: !Ref Project, Type: KEY_AND_VALUE}]
+          - Ec2TagGroup: [{Key: Environment, Value: !Ref EnvName, Type: KEY_AND_VALUE}]
+          - Ec2TagGroup: [{Key: Color, Value: blue, Type: KEY_AND_VALUE}]
+
+  GreenDeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: !Ref Application
+      DeploymentGroupName: !Sub '${Prefix}-green'
+      ServiceRoleArn: !GetAtt CodeDeployRole.Arn
+      DeploymentConfigName: CodeDeployDefault.AllAtOnce
+      DeploymentStyle: {DeploymentType: IN_PLACE, DeploymentOption: WITHOUT_TRAFFIC_CONTROL}
+      AutoRollbackConfiguration: {Enabled: true, Events: [DEPLOYMENT_FAILURE]}
+      Ec2TagSet:
+        Ec2TagSetList:
+          - Ec2TagGroup: [{Key: Project, Value: !Ref Project, Type: KEY_AND_VALUE}]
+          - Ec2TagGroup: [{Key: Environment, Value: !Ref EnvName, Type: KEY_AND_VALUE}]
+          - Ec2TagGroup: [{Key: Color, Value: green, Type: KEY_AND_VALUE}]
+
+  # The AutomationAssumeRole of Release and Switch. No cloudformation:* at all: the deployment
+  # reads …/infra/alb, never a stack.
+  AutomationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Prefix}-automation'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ssm.amazonaws.com}
+            Action: 'sts:AssumeRole'
+            Condition: {StringEquals: {'aws:SourceAccount': !Ref AWS::AccountId}}
+      Policies:
+        - PolicyName: release
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['ssm:PutParameter', 'ssm:DeleteParameter']
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ParameterRoot}/state/*'
+              - Effect: Allow
+                Action: ['ssm:GetParameter', 'ssm:GetParameters', 'ssm:GetParametersByPath']
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ParameterRoot}/config*'
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ParameterRoot}/state/*'
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ParameterRoot}/infra/*'
+              - Effect: Allow
+                Action: 'ssm:SendCommand'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}::document/AWS-ApplyAnsiblePlaybooks'
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:document/${Prefix}-Validate'
+              - Effect: Allow
+                Action: 'ssm:SendCommand'
+                Resource: !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*'
+                Condition:
+                  StringEquals:
+                    'ssm:resourceTag/Project': !Ref Project
+                    'ssm:resourceTag/Environment': !Ref EnvName
+              - Effect: Allow
+                Action:
+                  - 'ssm:ListCommands'
+                  - 'ssm:ListCommandInvocations'
+                  - 'ssm:GetCommandInvocation'
+                  - 'ssm:DescribeInstanceInformation'
+                  - 'ec2:DescribeInstances'
+                  - 'elasticloadbalancing:DescribeListeners'
+                  - 'elasticloadbalancing:DescribeTargetHealth'
+                  - 'cloudwatch:GetMetricData'
+                Resource: '*'
+              # Switch runs nested, with this same role.
+              - Effect: Allow
+                Action: ['ssm:StartAutomationExecution', 'ssm:GetAutomationExecution']
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:automation-definition/${Prefix}-Switch:*'
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:automation-execution/*'
+              - Effect: Allow
+                Action: 'iam:PassRole'
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${Prefix}-automation'
+                Condition: {StringEquals: {'iam:PassedToService': ssm.amazonaws.com}}
+              - Effect: Allow
+                Action:
+                  - 'codedeploy:CreateDeployment'
+                  - 'codedeploy:GetDeployment'
+                  - 'codedeploy:ListDeployments'
+                  - 'codedeploy:GetDeploymentConfig'
+                  - 'codedeploy:GetApplication'
+                  - 'codedeploy:GetApplicationRevision'
+                  - 'codedeploy:RegisterApplicationRevision'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:codedeploy:${AWS::Region}:${AWS::AccountId}:application:${Prefix}'
+                  - !Sub 'arn:${AWS::Partition}:codedeploy:${AWS::Region}:${AWS::AccountId}:deploymentgroup:${Prefix}/*'
+                  - !Sub 'arn:${AWS::Partition}:codedeploy:${AWS::Region}:${AWS::AccountId}:deploymentconfig:*'
+              # HeadObject is authorized by s3:GetObject (s3:GetObjectVersion with a VersionId).
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                  - 's3:GetObjectTagging'
+                  - 's3:GetObjectVersionTagging'
+                Resource:
+                  - !Sub '${ReleaseBucket.Arn}/releases/*'
+                  - !Sub '${ReleaseBucket.Arn}/config-releases/*'
+              - Effect: Allow
+                Action: 'elasticloadbalancing:ModifyListener'
+                Resource: !Sub 'arn:${AWS::Partition}:elasticloadbalancing:${AWS::Region}:${AWS::AccountId}:listener/app/${Prefix}/*'
+              - Effect: Allow
+                Action: 'secretsmanager:DescribeSecret'
+                Resource: !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretName}-??????'
+
+  EventsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Prefix}-events'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: events.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      Policies:
+        - PolicyName: start-release
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 'ssm:StartAutomationExecution'
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:automation-definition/${Prefix}-Release:*'
+              - Effect: Allow
+                Action: 'iam:PassRole'
+                Resource: !GetAtt AutomationRole.Arn
+
+  # Publishing is deploying. prefix and suffix cannot be combined on one field (a key repeated in
+  # a pattern keeps the last one), so "releases/ and .zip" is a single wildcard.
+  ReleaseRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${Prefix}-release'
+      Description: Object Created under releases/*.zip starts the Release runbook.
+      EventPattern:
+        source: [aws.s3]
+        detail-type: [Object Created]
+        detail:
+          bucket: {name: [!Ref ReleaseBucket]}
+          object: {key: [{wildcard: 'releases/*.zip'}]}
+      Targets:
+        - Id: release
+          Arn: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:automation-definition/${Prefix}-Release:$DEFAULT'
+          RoleArn: !GetAtt EventsRole.Arn
+          # Every Automation parameter is a list of strings.
+          InputTransformer:
+            InputPathsMap:
+              key: $.detail.object.key
+              version: $.detail.object.version-id
+            InputTemplate: '{"RevisionKey":[<key>],"RevisionVersionId":[<version>]}'
+
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateOidc
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+
+  # Writes releases, and nothing else. PutObject with --tagging also needs s3:PutObjectTagging:
+  # that is why the tags are mutable and not the identity.
+  GitHubRole:
+    Type: AWS::IAM::Role
+    Condition: HasGitHub
+    Properties:
+      RoleName: !Sub '${Prefix}-github'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If
+                - CreateOidc
+                - !Ref GitHubOidcProvider
+                - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com'
+            Action: 'sts:AssumeRoleWithWebIdentity'
+            Condition:
+              StringEquals:
+                'token.actions.githubusercontent.com:aud': sts.amazonaws.com
+                'token.actions.githubusercontent.com:sub': !Ref GitHubSubject
+      Policies:
+        - PolicyName: publish
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['s3:PutObject', 's3:PutObjectTagging']
+                Resource:
+                  - !Sub '${ReleaseBucket.Arn}/releases/*'
+                  - !Sub '${ReleaseBucket.Arn}/config-releases/*'
+
+Outputs:
+  BucketName:
+    Value: !Ref ReleaseBucket
+  InstanceProfileName:
+    Value: !Ref InstanceProfile
+  AutomationRoleArn:
+    Value: !GetAtt AutomationRole.Arn
+  GitHubRoleArn:
+    Condition: HasGitHub
+    Value: !GetAtt GitHubRole.Arn

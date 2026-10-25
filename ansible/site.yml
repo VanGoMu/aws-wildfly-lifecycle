@@ -1,0 +1,245 @@
+---
+# The configuration release (config-releases/wildfly-config/<v>/wildfly-config-<v>.zip): this
+# playbook at the root, vars/ and collections/ansible_collections/community/general/, where
+# Ansible finds the collection next to the playbook without any configuration. The Release
+# runbook runs it on the idle color with AWS-ApplyAnsiblePlaybooks, which unzips it and runs:
+#   ansible-playbook -i "localhost," -c local -e "<ExtraVariables>" site.yml
+# ExtraVariables: config_path, config_version and fingerprint. The instance reads the values with
+# its own role; Run Command never carries them. The secret ID comes from instance.env.
+#
+# Ansible owns <system-properties> of standalone.xml and edits it with WildFly stopped (a running
+# WildFly rewrites the file); WildFly owns <deployments> (jboss-cli deploy persists it). Neither
+# touches the other's subtree. A secret becomes the expression ${env.KEY}, which WildFly resolves
+# from the tmpfs file the unit loads: the value never reaches standalone.xml. A key missing there
+# stops the boot (WFLYSRV0056): the readiness wait fails and the rescue restores the copy.
+#
+# The test seam: with config_values and secret_keys as extra variables, nothing calls aws.
+#   -e '{"config_values": {"app.greeting": "hola"}, "secret_keys": ["DB_PASSWORD"]}'
+- name: WildFly configuration release
+  hosts: localhost
+  connection: local
+  become: true
+  gather_facts: false
+  vars_files:
+    - vars/main.yml
+
+  tasks:
+    - name: Check the release variables
+      ansible.builtin.assert:
+        that:
+          - config_path is match('^/aws-wildfly-lifecycle/[a-z][a-z0-9]{0,9}/config$')
+          - config_version is match('^[0-9]+[.][0-9]+[.][0-9]+(-[0-9A-Za-z.]+)?$')
+          - fingerprint is match('^[0-9a-f]{64}$')
+        quiet: true
+
+    - name: Read instance.env
+      ansible.builtin.slurp:
+        src: "{{ instance_env }}"
+      register: instance_env_raw
+
+    - name: Parse instance.env
+      ansible.builtin.set_fact:
+        instance: "{{ dict(instance_env_raw.content | b64decode
+                      | regex_findall('(?m)^([A-Z_]+)=(.*)$')) }}"
+
+    - name: Read the configuration from Parameter Store
+      ansible.builtin.command:
+        argv: [aws, ssm, get-parameters-by-path, --region, "{{ instance.REGION }}",
+               --path, "{{ config_path }}", --recursive, --query, Parameters, --output, json]
+      register: parameters_raw
+      changed_when: false
+      when: config_values is not defined
+
+    # Only the key names leave this task; no_log keeps the values out of the output.
+    - name: Read the key names of the secret
+      ansible.builtin.command:
+        argv: [aws, secretsmanager, get-secret-value, --region, "{{ instance.REGION }}",
+               --secret-id, "{{ instance.SECRET_ID }}", --query, SecretString, --output, text]
+      register: secret_raw
+      changed_when: false
+      failed_when: secret_raw.rc != 0 and 'ResourceNotFoundException' not in secret_raw.stderr
+      no_log: true
+      when: secret_keys is not defined
+
+    - name: Compute the desired system properties
+      ansible.builtin.set_fact:
+        desired: "{{ params | combine(secrets, lifecycle) }}"
+      vars:
+        found: "{{ parameters_raw.stdout | default('[]') | from_json }}"
+        params: "{{ (config_values | default(dict(found | map(attribute='Name') | map('basename')
+                    | zip(found | map(attribute='Value'))))) | dict2items
+                    | selectattr('key', 'match', parameter_name_pattern) | items2dict }}"
+        keys: "{{ (secret_keys | default((secret_raw.stdout | default('{}', true) | from_json
+                  | list) if (secret_raw.rc | default(1)) == 0 else []))
+                  | select('match', secret_key_pattern) | list }}"
+        secrets: "{{ dict(keys | map('regex_replace', '^', 'app.secret.')
+                     | zip(keys | map('regex_replace', '^(.+)$', '${env.\\1}'))) }}"
+        lifecycle:
+          lifecycle.config-version: "{{ config_version }}"
+          lifecycle.config-fingerprint: "{{ fingerprint }}"
+
+    # The namespace changes between WildFly versions (urn:jboss:domain:community:20.0 in 35):
+    # it is read from <server>. no_log: with -v, slurp prints the whole file in base64, and Run
+    # Command returns only the first 24,000 characters of the output.
+    - name: Read standalone.xml
+      ansible.builtin.slurp:
+        src: "{{ wildfly_config }}"
+      register: standalone_raw
+      no_log: true
+
+    - name: Read the namespace of the server element
+      ansible.builtin.set_fact:
+        namespace: "{{ standalone_raw.content | b64decode
+                       | regex_search('<server[^>]*xmlns=\"([^\"]+)\"', '\\1') | first }}"
+
+    # content: attribute fails when the xpath matches nothing (the standalone.xml of WildFly 35
+    # has no <system-properties>): count first.
+    - name: Count the current system properties
+      community.general.xml:
+        path: "{{ wildfly_config }}"
+        xpath: /s:server/s:system-properties/s:property
+        namespaces: {s: "{{ namespace }}"}
+        count: true
+      register: properties
+
+    - name: Read the current system properties
+      community.general.xml:
+        path: "{{ wildfly_config }}"
+        xpath: /s:server/s:system-properties/s:property
+        namespaces: {s: "{{ namespace }}"}
+        content: attribute
+      register: current_raw
+      when: properties.count > 0
+
+    # Each match is {"{<namespace>}property": {"name": …, "value": …}}.
+    - name: Compute the managed properties in place
+      ansible.builtin.set_fact:
+        current: "{{ current_raw.matches | default([]) | map('dict2items') | map('first')
+                     | map(attribute='value') | items2dict(key_name='name', value_name='value')
+                     | dict2items
+                     | selectattr('key', 'match', managed_property_pattern) | items2dict }}"
+
+    # If the XML already says what this release wants, WildFly is not stopped: a repeated run
+    # (same version, same fingerprint) is a no-op without an outage.
+    - name: Apply the release
+      when: current != desired
+      block:
+        - name: Copy standalone.xml before touching it
+          ansible.builtin.copy:
+            src: "{{ wildfly_config }}"
+            dest: "{{ wildfly_config }}.{{ config_version }}-{{ fingerprint[:8] }}.bak"
+            remote_src: true
+            owner: "{{ wildfly_user }}"
+            group: "{{ wildfly_user }}"
+            mode: "0644"
+
+        - name: Find the copies
+          ansible.builtin.find:
+            paths: "{{ wildfly_config | dirname }}"
+            patterns: "standalone.xml.*.bak"
+          register: backups
+
+        - name: Delete the copies beyond the newest ones
+          ansible.builtin.file:
+            path: "{{ item.path }}"
+            state: absent
+          loop: "{{ (backups.files | sort(attribute='mtime', reverse=true))[backups_keep:] }}"
+          loop_control:
+            label: "{{ item.path | basename }}"
+
+        - name: Stop WildFly
+          ansible.builtin.systemd_service:
+            name: "{{ wildfly_service }}"
+            state: stopped
+
+        # WildFly reads the children of <server> in a fixed order: system-properties goes right
+        # after extensions, in the namespace of the file, or WildFly does not boot
+        # (WFLYCTL0198). No pretty_print: it would reindent the whole file.
+        - name: Create system-properties right after extensions
+          community.general.xml:
+            path: "{{ wildfly_config }}"
+            xpath: /s:server/s:extensions
+            namespaces: {s: "{{ namespace }}"}
+            insertafter: true
+            input_type: xml
+            add_children:
+              - '<system-properties xmlns="{{ namespace }}"/>'
+          when: "'<system-properties' not in (standalone_raw.content | b64decode)"
+
+        - name: Remove the managed properties this release no longer has
+          community.general.xml:
+            path: "{{ wildfly_config }}"
+            xpath: /s:server/s:system-properties/s:property[@name='{{ item }}']
+            namespaces: {s: "{{ namespace }}"}
+            state: absent
+          loop: "{{ current.keys() | difference(desired.keys()) }}"
+
+        - name: Set the managed properties
+          community.general.xml:
+            path: "{{ wildfly_config }}"
+            xpath: /s:server/s:system-properties/s:property[@name='{{ item.key }}']
+            namespaces: {s: "{{ namespace }}"}
+            attribute: value
+            value: "{{ item.value }}"
+          loop: "{{ desired | dict2items }}"
+          loop_control:
+            label: "{{ item.key }}"
+
+        - name: Give standalone.xml back to the WildFly user
+          ansible.builtin.file:
+            path: "{{ wildfly_config }}"
+            owner: "{{ wildfly_user }}"
+            group: "{{ wildfly_user }}"
+
+        - name: Start WildFly
+          ansible.builtin.systemd_service:
+            name: "{{ wildfly_service }}"
+            state: started
+
+        # systemctl start returns 0 as soon as the process is launched: readiness and the
+        # fingerprint read from the running server are what prove the release.
+        - name: Wait for health/ready
+          ansible.builtin.uri:
+            url: http://127.0.0.1:9990/health/ready
+            status_code: 200
+          register: ready
+          until: ready.status == 200
+          retries: "{{ ready_retries }}"
+          delay: "{{ ready_delay }}"
+
+        - name: Read the fingerprint from the running WildFly
+          ansible.builtin.command:
+            argv: ["{{ wildfly_cli }}", --connect, --output-json,
+                   "--command=/system-property=lifecycle.config-fingerprint:read-attribute(name=value)"]
+          register: live
+          changed_when: false
+          failed_when: live.rc != 0 or (live.stdout | from_json).result | default('') != fingerprint
+
+      rescue:
+        - name: Restore the copy of standalone.xml
+          ansible.builtin.copy:
+            src: "{{ wildfly_config }}.{{ config_version }}-{{ fingerprint[:8] }}.bak"
+            dest: "{{ wildfly_config }}"
+            remote_src: true
+            owner: "{{ wildfly_user }}"
+            group: "{{ wildfly_user }}"
+            mode: "0644"
+
+        - name: Start WildFly with the previous configuration
+          ansible.builtin.systemd_service:
+            name: "{{ wildfly_service }}"
+            state: restarted
+
+        - name: Fail the release
+          ansible.builtin.fail:
+            msg: >-
+              Configuration {{ config_version }} was not applied: «{{ ansible_failed_task.name }}»
+              failed ({{ ansible_failed_result.msg | default('no message') }}). standalone.xml is
+              restored and WildFly runs with the previous configuration.
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg: >-
+          configuration {{ config_version }} fingerprint {{ fingerprint[:12] }}:
+          {{ 'already applied, WildFly not stopped' if current == desired
+             else (desired | length) ~ ' properties applied' }}

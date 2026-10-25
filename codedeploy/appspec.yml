@@ -1,0 +1,26 @@
+# CodeDeploy revision of aws-wildfly-lifecycle (EC2/On-Premises, in place). bin/artifact.sh build
+# packs it with hooks/ and wars/. The hooks are one-line wrappers: location is relative to the
+# root of the bundle, but the logic belongs to the platform installed on the instance. The scripts
+# of one lifecycle event cannot add up to more than 3,600 s.
+#
+# No ApplicationStop on purpose: CodeDeploy runs the ApplicationStop of the PREVIOUS revision, so a
+# broken one would block every deployment after it; deploy --force does not stop WildFly.
+version: 0.0
+os: linux
+files:
+  - source: wars
+    destination: /opt/wildfly-lifecycle/release/wars
+file_exists_behavior: OVERWRITE
+hooks:
+  BeforeInstall:
+    - location: hooks/before-install.sh
+      timeout: 60
+      runas: root
+  AfterInstall:
+    - location: hooks/after-install.sh
+      timeout: 600
+      runas: root
+  ValidateService:
+    - location: hooks/validate-service.sh
+      timeout: 600
+      runas: root

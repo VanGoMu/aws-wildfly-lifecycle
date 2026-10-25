@@ -1,0 +1,42 @@
+---
+# wfl-<env>-InstallWildFly (Command). bin/setup.sh render injects remote/install-wildfly.sh into
+# the step and the configuration, the derived names and the key and SHA-256 of platform.zip as
+# parameter defaults, so instances run it without parameters. With interpolationType ENV_VAR each
+# parameter reaches the script as SSM_<name>, never interpolated into the text; allowedPattern
+# still guards agents that predate it.
+schemaVersion: '2.2'
+description: >-
+  aws-wildfly-lifecycle: Java, WildFly, the CodeDeploy agent, ansible-core, the platform scripts
+  and the systemd unit, at pinned versions. Idempotent.
+parameters:
+  Region: {type: String, interpolationType: ENV_VAR, allowedPattern: '^[a-z]{2}(-[a-z]+)+-[0-9]$'}
+  Environment: {type: String, interpolationType: ENV_VAR, allowedPattern: '^[a-z][a-z0-9]{0,9}$'}
+  ConfigPath:
+    {type: String, interpolationType: ENV_VAR,
+     allowedPattern: '^/aws-wildfly-lifecycle/[a-z][a-z0-9]{0,9}/config$'}
+  SecretId:
+    {type: String, interpolationType: ENV_VAR,
+     allowedPattern: '^aws-wildfly-lifecycle/[a-z][a-z0-9]{0,9}/app$'}
+  AppPort: {type: String, interpolationType: ENV_VAR, allowedPattern: '^[1-9][0-9]{3,4}$'}
+  HealthPath: {type: String, interpolationType: ENV_VAR, allowedPattern: '^/[A-Za-z0-9/_.-]*$'}
+  JavaPackage: {type: String, interpolationType: ENV_VAR, allowedPattern: '^[a-z0-9][a-z0-9.+-]*$'}
+  WildFlyVersion:
+    {type: String, interpolationType: ENV_VAR, allowedPattern: '^[0-9]+\.[0-9]+\.[0-9]+\.Final$'}
+  WildFlySha256: {type: String, interpolationType: ENV_VAR, allowedPattern: '^[0-9a-f]{64}$'}
+  WildFlySource:
+    {type: String, interpolationType: ENV_VAR, description: 's3:// (vendor/, the default) or https://',
+     allowedPattern: '^(s3|https)://[A-Za-z0-9._/-]+\.tar\.gz$'}
+  CodeDeployAgentVersion:
+    {type: String, interpolationType: ENV_VAR, allowedPattern: '^[0-9]+\.[0-9]+\.[0-9]+-[0-9]+$'}
+  PlatformSource:
+    {type: String, interpolationType: ENV_VAR,
+     allowedPattern: '^s3://[a-z0-9.-]+/platform/[0-9a-f]{64}/platform\.zip$'}
+  PlatformSha256: {type: String, interpolationType: ENV_VAR, allowedPattern: '^[0-9a-f]{64}$'}
+mainSteps:
+  - action: aws:runShellScript
+    name: installWildFly
+    precondition:
+      StringEquals: [platformType, Linux]
+    inputs:
+      timeoutSeconds: '1800'
+      runCommand: []

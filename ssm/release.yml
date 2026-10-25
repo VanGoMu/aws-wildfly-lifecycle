@@ -1,0 +1,272 @@
+---
+# wfl-<env>-Release (Automation). Converges one color to (application revision, configuration
+# version) and, with Promote, runs a canary with the ALB weights and switches, or goes back.
+# bin/setup.sh render injects automation/runbook.py into every aws:executeScript step (each picks
+# its Handler), the derived names as parameter defaults, the Observe duration (CANARY_MINUTES + 2
+# min) and MinRequests. Every "only if" is an aws:branch.
+#
+# How a failure ends: all steps keep isCritical (true by default), so a failed step leaves the
+# execution Failed even when onFailure sends it on. Before Canary, onFailure goes to Unlock; from
+# Canary on, to Rollback. onCancel, the same (it cannot go to an aws:sleep).
+schemaVersion: '0.3'
+description: >-
+  aws-wildfly-lifecycle: converge a color to (revision, configuration), canary and switch. Started
+  by EventBridge for every revision published under releases/, and by bin/*.sh.
+assumeRole: '{{ AutomationAssumeRole }}'
+parameters:
+  RevisionKey:
+    type: String
+    description: The revision; empty = the one of the active color.
+    default: ''
+    allowedPattern: '^(releases/[a-z][a-z0-9-]+/[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?/[a-z][a-z0-9-]+-[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?\.zip)?$'
+  RevisionVersionId:
+    {type: String, description: 'Its S3 VersionId; empty = the current one.', default: '',
+     allowedPattern: '^[A-Za-z0-9._-]{0,1024}$'}
+  ConfigVersion:
+    {type: String, description: 'The configuration release; empty = the one of the active color.',
+     default: '', allowedPattern: '^([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?)?$'}
+  TargetColor:
+    {type: String, description: 'The color to converge; empty = the idle one.', default: '',
+     allowedPattern: '^(blue|green)?$'}
+  Promote: {type: Boolean, default: true}
+  CanaryWeight:
+    type: Integer
+    description: Percentage of requests to the target color during the canary; 0 = no canary.
+    allowedValues: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+                    23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42,
+                    43, 44, 45, 46, 47, 48, 49, 50]
+  AutomationAssumeRole:
+    {type: String, allowedPattern: '^arn:aws[a-z-]*:iam::[0-9]{12}:role/wfl-[a-z][a-z0-9]{0,9}-automation$'}
+  # Derived names: bin/setup.sh render writes them as defaults.
+  Region: {type: String, allowedPattern: '^[a-z]{2}(-[a-z]+)+-[0-9]$'}
+  Environment: {type: String, allowedPattern: '^[a-z][a-z0-9]{0,9}$'}
+  Project: {type: String, allowedPattern: '^aws-wildfly-lifecycle$'}
+  Prefix: {type: String, allowedPattern: '^wfl-[a-z][a-z0-9]{0,9}$'}
+  Bucket: {type: String, allowedPattern: '^wfl-[a-z0-9-]{3,58}$'}
+  ParameterRoot: {type: String, allowedPattern: '^/aws-wildfly-lifecycle/[a-z][a-z0-9]{0,9}$'}
+  SecretId: {type: String, allowedPattern: '^aws-wildfly-lifecycle/[a-z][a-z0-9]{0,9}/app$'}
+  SwitchRunbook: {type: String, allowedPattern: '^wfl-[a-z][a-z0-9]{0,9}-Switch$'}
+mainSteps:
+  # The lock is written without Overwrite: if it exists, another release holds it, and this one
+  # fails here without touching anything. Abort, never Unlock: the lock is someone else's.
+  - name: Lock
+    action: aws:executeAwsApi
+    onFailure: Abort
+    inputs: {Service: ssm, Api: PutParameter, Name: '{{ ParameterRoot }}/state/lock',
+             Value: '{{ automation:EXECUTION_ID }}', Type: String, Overwrite: false}
+  - name: Plan
+    action: aws:executeScript
+    timeoutSeconds: 120
+    onFailure: step:Unlock
+    onCancel: step:Unlock
+    inputs:
+      Runtime: python3.12
+      Handler: plan
+      Script: ''
+      InputPayload:
+        Mode: release
+        RevisionKey: '{{ RevisionKey }}'
+        RevisionVersionId: '{{ RevisionVersionId }}'
+        ConfigVersion: '{{ ConfigVersion }}'
+        TargetColor: '{{ TargetColor }}'
+        Promote: '{{ Promote }}'
+        CanaryWeight: '{{ CanaryWeight }}'
+        Region: '{{ Region }}'
+        Environment: '{{ Environment }}'
+        Project: '{{ Project }}'
+        Prefix: '{{ Prefix }}'
+        Bucket: '{{ Bucket }}'
+        ParameterRoot: '{{ ParameterRoot }}'
+        SecretId: '{{ SecretId }}'
+    outputs:
+      - {Name: TargetColor, Selector: $.Payload.TargetColor, Type: String}
+      - {Name: ActiveColor, Selector: $.Payload.ActiveColor, Type: String}
+      - {Name: TargetInstanceId, Selector: $.Payload.TargetInstanceId, Type: String}
+      - {Name: TargetDeploymentGroup, Selector: $.Payload.TargetDeploymentGroup, Type: String}
+      - {Name: HasAlb, Selector: $.Payload.HasAlb, Type: Boolean}
+      - {Name: Skip, Selector: $.Payload.Skip, Type: Boolean}
+      - {Name: ConfigChanged, Selector: $.Payload.ConfigChanged, Type: Boolean}
+      - {Name: RevisionChanged, Selector: $.Payload.RevisionChanged, Type: Boolean}
+      - {Name: CanaryWeight, Selector: $.Payload.CanaryWeight, Type: Integer}
+      - {Name: ConfigSourceInfo, Selector: $.Payload.ConfigSourceInfo, Type: String}
+      - {Name: ExtraVariables, Selector: $.Payload.ExtraVariables, Type: String}
+      - {Name: RevisionBucket, Selector: $.Payload.RevisionBucket, Type: String}
+      - {Name: RevisionKey, Selector: $.Payload.RevisionKey, Type: String}
+      - {Name: RevisionVersion, Selector: $.Payload.RevisionVersion, Type: String}
+      - {Name: RevisionETag, Selector: $.Payload.RevisionETag, Type: String}
+      - {Name: TargetConfigState, Selector: $.Payload.TargetConfigState, Type: String}
+      - {Name: TargetReleaseState, Selector: $.Payload.TargetReleaseState, Type: String}
+      - {Name: Warnings, Selector: $.Payload.Warnings, Type: String}
+  - name: Skip
+    action: aws:branch
+    inputs:
+      Choices: [{NextStep: Unlock, Variable: '{{ Plan.Skip }}', BooleanEquals: true}]
+      Default: ConfigChanged
+  - name: ConfigChanged
+    action: aws:branch
+    inputs:
+      Choices: [{NextStep: ApplyConfig, Variable: '{{ Plan.ConfigChanged }}', BooleanEquals: true}]
+      Default: RevisionChanged
+  # Ansible on the idle color, with the ansible-core InstallWildFly installed (no dependencies
+  # from PyPI). Nested timeouts: 600 s of delivery + 900 s of Ansible < the 1,800 s of the step.
+  - name: ApplyConfig
+    action: aws:runCommand
+    timeoutSeconds: 1800
+    onFailure: step:Unlock
+    onCancel: step:Unlock
+    inputs:
+      DocumentName: AWS-ApplyAnsiblePlaybooks
+      DocumentVersion: '1'
+      InstanceIds: ['{{ Plan.TargetInstanceId }}']
+      TimeoutSeconds: 600
+      Parameters:
+        SourceType: [S3]
+        SourceInfo: ['{{ Plan.ConfigSourceInfo }}']
+        InstallDependencies: ['False']
+        PlaybookFile: [site.yml]
+        ExtraVariables: ['{{ Plan.ExtraVariables }}']
+        Check: ['False']
+        Verbose: ['-v']
+        TimeoutSeconds: ['900']
+  # Right here: if the deployment fails afterwards, the state still tells the truth.
+  - name: RecordConfig
+    action: aws:executeAwsApi
+    onFailure: step:Unlock
+    inputs: {Service: ssm, Api: PutParameter, Type: String, Overwrite: true,
+             Name: '{{ ParameterRoot }}/state/{{ Plan.TargetColor }}/config',
+             Value: '{{ Plan.TargetConfigState }}'}
+  - name: RevisionChanged
+    action: aws:branch
+    inputs:
+      Choices: [{NextStep: Deploy, Variable: '{{ Plan.RevisionChanged }}', BooleanEquals: true}]
+      Default: Promote
+  # version and eTag pin the exact bytes; on DEPLOYMENT_FAILURE CodeDeploy redeploys the last
+  # good revision, a new deployment that Plan waits for next time.
+  - name: Deploy
+    action: aws:executeAwsApi
+    onFailure: step:Unlock
+    onCancel: step:Unlock
+    inputs:
+      Service: codedeploy
+      Api: CreateDeployment
+      applicationName: '{{ Prefix }}'
+      deploymentGroupName: '{{ Plan.TargetDeploymentGroup }}'
+      description: '{{ automation:EXECUTION_ID }}'
+      fileExistsBehavior: OVERWRITE
+      revision:
+        revisionType: S3
+        s3Location:
+          bucket: '{{ Plan.RevisionBucket }}'
+          key: '{{ Plan.RevisionKey }}'
+          bundleType: zip
+          version: '{{ Plan.RevisionVersion }}'
+          eTag: '{{ Plan.RevisionETag }}'
+    outputs:
+      - {Name: DeploymentId, Selector: $.deploymentId, Type: String}
+  # Waiting only for Succeeded would leave a failure hanging until the timeout.
+  - name: WaitDeploy
+    action: aws:waitForAwsResourceProperty
+    timeoutSeconds: 1800
+    onFailure: step:Unlock
+    onCancel: step:Unlock
+    inputs:
+      Service: codedeploy
+      Api: GetDeployment
+      deploymentId: '{{ Deploy.DeploymentId }}'
+      PropertySelector: $.deploymentInfo.status
+      DesiredValues: [Succeeded, Failed, Stopped]
+  - name: AssertDeploy
+    action: aws:assertAwsResourceProperty
+    onFailure: step:Unlock
+    inputs:
+      Service: codedeploy
+      Api: GetDeployment
+      deploymentId: '{{ Deploy.DeploymentId }}'
+      PropertySelector: $.deploymentInfo.status
+      DesiredValues: [Succeeded]
+  - name: RecordRelease
+    action: aws:executeAwsApi
+    onFailure: step:Unlock
+    inputs: {Service: ssm, Api: PutParameter, Type: String, Overwrite: true,
+             Name: '{{ ParameterRoot }}/state/{{ Plan.TargetColor }}/release',
+             Value: '{{ Plan.TargetReleaseState }}'}
+  - name: Promote
+    action: aws:branch
+    inputs:
+      Choices:
+        - {NextStep: Unlock, Variable: '{{ Promote }}', BooleanEquals: false}
+        - {NextStep: Switch, Variable: '{{ Plan.CanaryWeight }}', NumericEquals: 0}
+      Default: Canary
+  - name: Canary
+    action: aws:executeScript
+    timeoutSeconds: 60
+    onFailure: step:Rollback
+    onCancel: step:Rollback
+    inputs:
+      Runtime: python3.12
+      Handler: shift_traffic
+      Script: ''
+      InputPayload:
+        Target: '{{ Plan.TargetColor }}'
+        Weight: '{{ Plan.CanaryWeight }}'
+        Environment: '{{ Environment }}'
+        Project: '{{ Project }}'
+        ParameterRoot: '{{ ParameterRoot }}'
+    outputs:
+      - {Name: StartTime, Selector: $.Payload.StartTime, Type: String}
+  # Fixed when the runbook is registered: CANARY_MINUTES + 2 min, because ALB metrics are late.
+  - name: Observe
+    action: aws:sleep
+    onFailure: step:Rollback
+    onCancel: step:Rollback
+    inputs: {Duration: PT7M}
+  - name: CheckCanary
+    action: aws:executeScript
+    timeoutSeconds: 120
+    onFailure: step:Rollback
+    onCancel: step:Rollback
+    inputs:
+      Runtime: python3.12
+      Handler: check_canary
+      Script: ''
+      InputPayload:
+        Target: '{{ Plan.TargetColor }}'
+        Start: '{{ Canary.StartTime }}'
+        MinRequests: 0
+        Environment: '{{ Environment }}'
+        Project: '{{ Project }}'
+        ParameterRoot: '{{ ParameterRoot }}'
+  - name: Switch
+    action: aws:executeAutomation
+    timeoutSeconds: 900
+    onFailure: step:Rollback
+    onCancel: step:Rollback
+    inputs:
+      DocumentName: '{{ SwitchRunbook }}'
+      RuntimeParameters:
+        TargetColor: ['{{ Plan.TargetColor }}']
+        AutomationAssumeRole: ['{{ AutomationAssumeRole }}']
+  - name: Unlock
+    action: aws:executeAwsApi
+    isEnd: true
+    inputs: {Service: ssm, Api: DeleteParameter, Name: '{{ ParameterRoot }}/state/lock'}
+  # Everything back to the active color; the failed step already made the execution Failed.
+  - name: Rollback
+    action: aws:executeScript
+    timeoutSeconds: 60
+    nextStep: Unlock
+    onFailure: step:Unlock
+    inputs:
+      Runtime: python3.12
+      Handler: shift_traffic
+      Script: ''
+      InputPayload:
+        Target: '{{ Plan.TargetColor }}'
+        Weight: 0
+        Environment: '{{ Environment }}'
+        Project: '{{ Project }}'
+        ParameterRoot: '{{ ParameterRoot }}'
+outputs:
+  - Plan.TargetColor
+  - Plan.ActiveColor
+  - Plan.Warnings

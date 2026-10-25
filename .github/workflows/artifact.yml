@@ -1,0 +1,54 @@
+# A v* tag (or a manual run) builds the CodeDeploy revision and publishes it with the same scripts
+# as a laptop. Publishing is deploying: S3 → EventBridge starts the Release runbook. The GitHub
+# environment holds AWS_REGION, AWS_ROLE_ARN and ENV_NAME as variables; the rest of the
+# configuration is config/example.env.
+name: artifact
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to build and publish (x.y.z)
+        required: true
+      environment:
+        description: GitHub environment with AWS_REGION, AWS_ROLE_ARN and ENV_NAME
+        default: dev
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: artifact-${{ github.ref }}
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    environment: ${{ inputs.environment || 'dev' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: corretto
+          java-version: '21'
+          cache: maven
+          cache-dependency-path: app/pom.xml
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # The version reaches the shell as a variable, never interpolated into the script.
+      - name: Build and publish
+        env:
+          ENV_NAME: ${{ vars.ENV_NAME }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          VERSION: ${{ inputs.version || github.ref_name }}
+        run: |
+          cp config/example.env "config/${ENV_NAME}.env"
+          zip=$(bin/artifact.sh build "${VERSION#v}")
+          bin/artifact.sh publish "$zip"
