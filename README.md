@@ -6,7 +6,9 @@ Manager, y hace copias de seguridad de la AMI.
 
 Todo son scripts de bash pequeños sobre la AWS CLI y servicios gestionados de AWS. No hay servidores
 de CI propios ni estado local: la verdad vive en AWS. Cada paso también se puede hacer a mano desde
-la consola, con los mismos nombres: lo cuenta [docs/manual-consola.md](docs/manual-consola.md).
+la consola, con los mismos nombres: lo cuenta [docs/manual-consola.md](docs/manual-consola.md). Y
+el ciclo completo, canary y blue/green incluidos, se puede probar en el portátil con Docker Compose
+y sin cuenta de AWS: lo cuenta [docs/local-development.md](docs/local-development.md).
 
 Publicar un artefacto **es** desplegarlo. El zip llega a S3 y EventBridge arranca un runbook de SSM
 Automation. El runbook lleva la release al color inactivo con CodeDeploy, abre un canary con los

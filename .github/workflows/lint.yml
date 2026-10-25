@@ -28,10 +28,10 @@ jobs:
 
       - name: bash
         run: |
-          bash -n bin/*.sh lib/*.sh remote/*.sh codedeploy/hooks/*.sh
-          shellcheck -x -S warning bin/*.sh lib/*.sh remote/*.sh codedeploy/hooks/*.sh
+          bash -n bin/*.sh lib/*.sh remote/*.sh codedeploy/hooks/*.sh local/*.sh
+          shellcheck -x -S warning bin/*.sh lib/*.sh remote/*.sh codedeploy/hooks/*.sh local/*.sh
           awk 'length > 100 { print FILENAME ":" FNR; bad = 1 } END { exit bad }' \
-            bin/*.sh lib/*.sh remote/*.sh automation/runbook.py
+            bin/*.sh lib/*.sh remote/*.sh automation/runbook.py local/*.sh
 
       - name: Python
         run: |
